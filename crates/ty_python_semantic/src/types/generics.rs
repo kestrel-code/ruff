@@ -14,7 +14,9 @@ use crate::semantic_index::scope::{FileScopeId, NodeWithScopeKey, NodeWithScopeK
 use crate::semantic_index::{SemanticIndex, semantic_index};
 use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
-use crate::types::constraints::{ConstraintSet, IteratorConstraintsExtension, Solutions};
+use crate::types::constraints::{
+    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, Solutions,
+};
 use crate::types::instance::{Protocol, ProtocolInstanceType};
 use crate::types::relation::{
     HasRelationToVisitor, IsDisjointVisitor, IsEquivalentVisitor, TypeRelation,
@@ -1000,6 +1002,7 @@ fn is_subtype_in_invariant_position<'db>(
     derived_materialization: MaterializationKind,
     base_type: &Type<'db>,
     base_materialization: MaterializationKind,
+    constraints: &mut ConstraintSetBuilder<'db>,
     inferable: InferableTypeVars<'_, 'db>,
     relation_visitor: &HasRelationToVisitor<'db>,
     disjointness_visitor: &IsDisjointVisitor<'db>,
@@ -1009,7 +1012,7 @@ fn is_subtype_in_invariant_position<'db>(
     let base_top = base_type.top_materialization(db);
     let base_bottom = base_type.bottom_materialization(db);
 
-    let is_subtype_of = |derived: Type<'db>, base: Type<'db>| {
+    let mut is_subtype_of = |derived: Type<'db>, base: Type<'db>| {
         // TODO:
         // This should be removed and properly handled in the respective
         // `(Type::TypeVar(_), _) | (_, Type::TypeVar(_))` branch of
@@ -1025,6 +1028,7 @@ fn is_subtype_in_invariant_position<'db>(
         derived.has_relation_to_impl(
             db,
             base,
+            constraints,
             inferable,
             TypeRelation::Subtyping,
             relation_visitor,
@@ -1078,6 +1082,7 @@ fn has_relation_in_invariant_position<'db>(
     derived_materialization: Option<MaterializationKind>,
     base_type: &Type<'db>,
     base_materialization: Option<MaterializationKind>,
+    constraints: &mut ConstraintSetBuilder<'db>,
     inferable: InferableTypeVars<'_, 'db>,
     relation: TypeRelation<'db>,
     relation_visitor: &HasRelationToVisitor<'db>,
@@ -1092,6 +1097,7 @@ fn has_relation_in_invariant_position<'db>(
             derived_mat,
             base_type,
             base_mat,
+            constraints,
             inferable,
             relation_visitor,
             disjointness_visitor,
@@ -1112,6 +1118,7 @@ fn has_relation_in_invariant_position<'db>(
             .has_relation_to_impl(
                 db,
                 *base_type,
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1121,6 +1128,7 @@ fn has_relation_in_invariant_position<'db>(
                 base_type.has_relation_to_impl(
                     db,
                     *derived_type,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1138,6 +1146,7 @@ fn has_relation_in_invariant_position<'db>(
             MaterializationKind::Top,
             base_type,
             base_mat,
+            constraints,
             inferable,
             relation_visitor,
             disjointness_visitor,
@@ -1152,6 +1161,7 @@ fn has_relation_in_invariant_position<'db>(
             derived_mat,
             base_type,
             MaterializationKind::Bottom,
+            constraints,
             inferable,
             relation_visitor,
             disjointness_visitor,
@@ -1167,6 +1177,7 @@ fn has_relation_in_invariant_position<'db>(
             MaterializationKind::Bottom,
             base_type,
             base_mat,
+            constraints,
             inferable,
             relation_visitor,
             disjointness_visitor,
@@ -1181,6 +1192,7 @@ fn has_relation_in_invariant_position<'db>(
             derived_mat,
             base_type,
             MaterializationKind::Top,
+            constraints,
             inferable,
             relation_visitor,
             disjointness_visitor,
@@ -1482,10 +1494,12 @@ impl<'db> Specialization<'db> {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn has_relation_to_impl(
         self,
         db: &'db dyn Db,
         other: Self,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
@@ -1501,6 +1515,7 @@ impl<'db> Specialization<'db> {
             return self_tuple.has_relation_to_impl(
                 db,
                 other_tuple,
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1517,44 +1532,51 @@ impl<'db> Specialization<'db> {
             other.types(db)
         );
 
-        types.when_all(db, |(bound_typevar, self_type, other_type)| {
-            // Subtyping/assignability of each type in the specialization depends on the variance
-            // of the corresponding typevar:
-            //   - covariant: verify that self_type <: other_type
-            //   - contravariant: verify that other_type <: self_type
-            //   - invariant: verify that self_type <: other_type AND other_type <: self_type
-            //   - bivariant: skip, can't make subtyping/assignability false
-            match bound_typevar.variance(db) {
-                TypeVarVariance::Invariant => has_relation_in_invariant_position(
-                    db,
-                    self_type,
-                    self_materialization_kind,
-                    other_type,
-                    other_materialization_kind,
-                    inferable,
-                    relation,
-                    relation_visitor,
-                    disjointness_visitor,
-                ),
-                TypeVarVariance::Covariant => self_type.has_relation_to_impl(
-                    db,
-                    *other_type,
-                    inferable,
-                    relation,
-                    relation_visitor,
-                    disjointness_visitor,
-                ),
-                TypeVarVariance::Contravariant => other_type.has_relation_to_impl(
-                    db,
-                    *self_type,
-                    inferable,
-                    relation,
-                    relation_visitor,
-                    disjointness_visitor,
-                ),
-                TypeVarVariance::Bivariant => ConstraintSet::from(true),
-            }
-        })
+        types.when_all(
+            db,
+            constraints,
+            |constraints, (bound_typevar, self_type, other_type)| {
+                // Subtyping/assignability of each type in the specialization depends on the variance
+                // of the corresponding typevar:
+                //   - covariant: verify that self_type <: other_type
+                //   - contravariant: verify that other_type <: self_type
+                //   - invariant: verify that self_type <: other_type AND other_type <: self_type
+                //   - bivariant: skip, can't make subtyping/assignability false
+                match bound_typevar.variance(db) {
+                    TypeVarVariance::Invariant => has_relation_in_invariant_position(
+                        db,
+                        self_type,
+                        self_materialization_kind,
+                        other_type,
+                        other_materialization_kind,
+                        constraints,
+                        inferable,
+                        relation,
+                        relation_visitor,
+                        disjointness_visitor,
+                    ),
+                    TypeVarVariance::Covariant => self_type.has_relation_to_impl(
+                        db,
+                        *other_type,
+                        constraints,
+                        inferable,
+                        relation,
+                        relation_visitor,
+                        disjointness_visitor,
+                    ),
+                    TypeVarVariance::Contravariant => other_type.has_relation_to_impl(
+                        db,
+                        *self_type,
+                        constraints,
+                        inferable,
+                        relation,
+                        relation_visitor,
+                        disjointness_visitor,
+                    ),
+                    TypeVarVariance::Bivariant => ConstraintSet::from(true),
+                }
+            },
+        )
     }
 
     pub(crate) fn is_disjoint_from(
@@ -1566,6 +1588,7 @@ impl<'db> Specialization<'db> {
         self.is_disjoint_from_impl(
             db,
             other,
+            &mut ConstraintSetBuilder::new(),
             inferable,
             &IsDisjointVisitor::default(),
             &HasRelationToVisitor::default(),
@@ -1576,6 +1599,7 @@ impl<'db> Specialization<'db> {
         self,
         db: &'db dyn Db,
         other: Self,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
@@ -1590,6 +1614,7 @@ impl<'db> Specialization<'db> {
             return self_tuple.is_disjoint_from_impl(
                 db,
                 other_tuple,
+                constraints,
                 inferable,
                 disjointness_visitor,
                 relation_visitor,
@@ -1604,7 +1629,8 @@ impl<'db> Specialization<'db> {
 
         types.when_all(
             db,
-            |(bound_typevar, self_type, other_type)| match bound_typevar.variance(db) {
+            constraints,
+            |constraints, (bound_typevar, self_type, other_type)| match bound_typevar.variance(db) {
                 // TODO: This check can lead to false negatives.
                 //
                 // For example, `Foo[int]` and `Foo[bool]` are disjoint, even though `bool` is a subtype
@@ -1614,6 +1640,7 @@ impl<'db> Specialization<'db> {
                 TypeVarVariance::Invariant => self_type.is_disjoint_from_impl(
                     db,
                     *other_type,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -1635,6 +1662,7 @@ impl<'db> Specialization<'db> {
         self,
         db: &'db dyn Db,
         other: Specialization<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
@@ -1661,9 +1689,13 @@ impl<'db> Specialization<'db> {
             let compatible = match bound_typevar.variance(db) {
                 TypeVarVariance::Invariant
                 | TypeVarVariance::Covariant
-                | TypeVarVariance::Contravariant => {
-                    self_type.is_equivalent_to_impl(db, *other_type, inferable, visitor)
-                }
+                | TypeVarVariance::Contravariant => self_type.is_equivalent_to_impl(
+                    db,
+                    *other_type,
+                    constraints,
+                    inferable,
+                    visitor,
+                ),
                 TypeVarVariance::Bivariant => ConstraintSet::from(true),
             };
             if result.intersect(db, compatible).is_never_satisfied(db) {
@@ -1675,8 +1707,13 @@ impl<'db> Specialization<'db> {
             (Some(_), None) | (None, Some(_)) => return ConstraintSet::from(false),
             (None, None) => {}
             (Some(self_tuple), Some(other_tuple)) => {
-                let compatible =
-                    self_tuple.is_equivalent_to_impl(db, other_tuple, inferable, visitor);
+                let compatible = self_tuple.is_equivalent_to_impl(
+                    db,
+                    other_tuple,
+                    constraints,
+                    inferable,
+                    visitor,
+                );
                 if result.intersect(db, compatible).is_never_satisfied(db) {
                     return result;
                 }
@@ -1901,6 +1938,7 @@ impl<'db> SpecializationBuilder<'db> {
         let formal_is_single_paramspec = formal_signature.is_single_paramspec().is_some();
 
         for actual_callable in actual_callables.as_slice() {
+            let mut constraints = ConstraintSetBuilder::new();
             if formal_is_single_paramspec {
                 let when = actual_callable
                     .signatures(self.db)

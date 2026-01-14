@@ -4,7 +4,9 @@ use rustc_hash::FxHashSet;
 
 use crate::place::{DefinedPlace, Place};
 use crate::types::builder::RecursivelyDefined;
-use crate::types::constraints::{IteratorConstraintsExtension, OptionConstraintsExtension};
+use crate::types::constraints::{
+    ConstraintSetBuilder, IteratorConstraintsExtension, OptionConstraintsExtension,
+};
 use crate::types::enums::is_single_member_enum;
 use crate::types::{
     CallableType, ClassBase, ClassType, CycleDetector, DynamicType, KnownClass, KnownInstanceType,
@@ -322,6 +324,7 @@ impl<'db> Type<'db> {
         self.has_relation_to_impl(
             db,
             target,
+            &mut ConstraintSetBuilder::new(),
             inferable,
             relation,
             &HasRelationToVisitor::default(),
@@ -329,10 +332,12 @@ impl<'db> Type<'db> {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn has_relation_to_impl(
         self,
         db: &'db dyn Db,
         target: Type<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
@@ -396,6 +401,7 @@ impl<'db> Type<'db> {
                     self_alias.value_type(db).has_relation_to_impl(
                         db,
                         target,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -409,6 +415,7 @@ impl<'db> Type<'db> {
                     self.has_relation_to_impl(
                         db,
                         target_alias.value_type(db),
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -427,6 +434,7 @@ impl<'db> Type<'db> {
                     default_type.has_relation_to_impl(
                         db,
                         right,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -521,6 +529,7 @@ impl<'db> Type<'db> {
                         Type::TypeVar(this_instance).has_relation_to_impl(
                             db,
                             other_instance,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -537,6 +546,7 @@ impl<'db> Type<'db> {
                         Type::TypeVar(this_instance).has_relation_to_impl(
                             db,
                             other_instance,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -553,6 +563,7 @@ impl<'db> Type<'db> {
                         this_instance.has_relation_to_impl(
                             db,
                             Type::TypeVar(other_instance),
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -569,6 +580,7 @@ impl<'db> Type<'db> {
                         this_instance.has_relation_to_impl(
                             db,
                             Type::TypeVar(other_instance),
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -590,22 +602,28 @@ impl<'db> Type<'db> {
                         .has_relation_to_impl(
                             db,
                             target,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
                             disjointness_visitor,
                         ),
-                    Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
-                        constraints.elements(db).iter().when_all(db, |constraint| {
-                            constraint.has_relation_to_impl(
-                                db,
-                                target,
-                                inferable,
-                                relation,
-                                relation_visitor,
-                                disjointness_visitor,
-                            )
-                        })
+                    Some(TypeVarBoundOrConstraints::Constraints(typevar_constraints)) => {
+                        typevar_constraints.elements(db).iter().when_all(
+                            db,
+                            constraints,
+                            |constraints, constraint| {
+                                constraint.has_relation_to_impl(
+                                    db,
+                                    target,
+                                    constraints,
+                                    inferable,
+                                    relation,
+                                    relation_visitor,
+                                    disjointness_visitor,
+                                )
+                            },
+                        )
                     }
                 }
             }
@@ -618,17 +636,22 @@ impl<'db> Type<'db> {
                     && !bound_typevar
                         .typevar(db)
                         .constraints(db)
-                        .when_some_and(|constraints| {
-                            constraints.iter().when_all(db, |constraint| {
-                                self.has_relation_to_impl(
-                                    db,
-                                    *constraint,
-                                    inferable,
-                                    relation,
-                                    relation_visitor,
-                                    disjointness_visitor,
-                                )
-                            })
+                        .when_some_and(|typevar_constraints| {
+                            typevar_constraints.iter().when_all(
+                                db,
+                                constraints,
+                                |constraints, constraint| {
+                                    self.has_relation_to_impl(
+                                        db,
+                                        *constraint,
+                                        constraints,
+                                        inferable,
+                                        relation,
+                                        relation_visitor,
+                                        disjointness_visitor,
+                                    )
+                                },
+                            )
                         })
                         .is_never_satisfied(db) =>
             {
@@ -639,17 +662,22 @@ impl<'db> Type<'db> {
                 bound_typevar
                     .typevar(db)
                     .constraints(db)
-                    .when_some_and(|constraints| {
-                        constraints.iter().when_all(db, |constraint| {
-                            self.has_relation_to_impl(
-                                db,
-                                *constraint,
-                                inferable,
-                                relation,
-                                relation_visitor,
-                                disjointness_visitor,
-                            )
-                        })
+                    .when_some_and(|typevar_constraints| {
+                        typevar_constraints.iter().when_all(
+                            db,
+                            constraints,
+                            |constraints, constraint| {
+                                self.has_relation_to_impl(
+                                    db,
+                                    *constraint,
+                                    constraints,
+                                    inferable,
+                                    relation,
+                                    relation_visitor,
+                                    disjointness_visitor,
+                                )
+                            },
+                        )
                     })
             }
 
@@ -716,10 +744,11 @@ impl<'db> Type<'db> {
                 union
                     .elements(db)
                     .iter()
-                    .when_any(db, |&elem_ty| {
+                    .when_any(db, constraints, |constraints, &elem_ty| {
                         self.has_relation_to_impl(
                             db,
                             elem_ty,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -735,6 +764,7 @@ impl<'db> Type<'db> {
                             concrete_base.has_relation_to_impl(
                                 db,
                                 target,
+                                constraints,
                                 inferable,
                                 relation,
                                 relation_visitor,
@@ -745,28 +775,52 @@ impl<'db> Type<'db> {
                         }
                     })
             }
-
-            (Type::Union(union), _) => union.elements(db).iter().when_all(db, |&elem_ty| {
-                elem_ty.has_relation_to_impl(
+            // All other `NewType` assignments fall back to the concrete base type.
+            (Type::NewTypeInstance(self_newtype), _) => {
+                self_newtype.concrete_base_type(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
                     disjointness_visitor,
                 )
-            }),
+            }
 
-            (_, Type::Union(union)) => union.elements(db).iter().when_any(db, |&elem_ty| {
-                self.has_relation_to_impl(
-                    db,
-                    elem_ty,
-                    inferable,
-                    relation,
-                    relation_visitor,
-                    disjointness_visitor,
-                )
-            }),
+            (Type::Union(union), _) => {
+                union
+                    .elements(db)
+                    .iter()
+                    .when_all(db, constraints, |constraints, &elem_ty| {
+                        elem_ty.has_relation_to_impl(
+                            db,
+                            target,
+                            constraints,
+                            inferable,
+                            relation,
+                            relation_visitor,
+                            disjointness_visitor,
+                        )
+                    })
+            }
+
+            (_, Type::Union(union)) => {
+                union
+                    .elements(db)
+                    .iter()
+                    .when_any(db, constraints, |constraints, &elem_ty| {
+                        self.has_relation_to_impl(
+                            db,
+                            elem_ty,
+                            constraints,
+                            inferable,
+                            relation,
+                            relation_visitor,
+                            disjointness_visitor,
+                        )
+                    })
+            }
 
             // If both sides are intersections we need to handle the right side first
             // (A & B & C) is a subtype of (A & B) because the left is a subtype of both A and B,
@@ -774,10 +828,11 @@ impl<'db> Type<'db> {
             (_, Type::Intersection(intersection)) => intersection
                 .positive(db)
                 .iter()
-                .when_all(db, |&pos_ty| {
+                .when_all(db, constraints, |constraints, &pos_ty| {
                     self.has_relation_to_impl(
                         db,
                         pos_ty,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -806,24 +861,29 @@ impl<'db> Type<'db> {
                             self.bottom_materialization(db)
                         }
                     };
-                    intersection.negative(db).iter().when_all(db, |&neg_ty| {
-                        let neg_ty = match relation {
-                            TypeRelation::Subtyping
-                            | TypeRelation::Redundancy
-                            | TypeRelation::SubtypingAssuming(_) => neg_ty,
-                            TypeRelation::Assignability
-                            | TypeRelation::ConstraintSetAssignability => {
-                                neg_ty.bottom_materialization(db)
-                            }
-                        };
-                        self_ty.is_disjoint_from_impl(
-                            db,
-                            neg_ty,
-                            inferable,
-                            disjointness_visitor,
-                            relation_visitor,
-                        )
-                    })
+                    intersection.negative(db).iter().when_all(
+                        db,
+                        constraints,
+                        |constraints, &neg_ty| {
+                            let neg_ty = match relation {
+                                TypeRelation::Subtyping
+                                | TypeRelation::Redundancy
+                                | TypeRelation::SubtypingAssuming(_) => neg_ty,
+                                TypeRelation::Assignability
+                                | TypeRelation::ConstraintSetAssignability => {
+                                    neg_ty.bottom_materialization(db)
+                                }
+                            };
+                            self_ty.is_disjoint_from_impl(
+                                db,
+                                neg_ty,
+                                constraints,
+                                inferable,
+                                disjointness_visitor,
+                                relation_visitor,
+                            )
+                        },
+                    )
                 }),
 
             (Type::Intersection(intersection), _) => {
@@ -862,6 +922,7 @@ impl<'db> Type<'db> {
                             .has_relation_to_impl(
                                 db,
                                 bound,
+                                constraints,
                                 inferable,
                                 relation,
                                 relation_visitor,
@@ -876,6 +937,7 @@ impl<'db> Type<'db> {
                     self.has_relation_to_impl(
                         db,
                         bound,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -902,6 +964,7 @@ impl<'db> Type<'db> {
                 self_newtype.concrete_base_type(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -927,6 +990,7 @@ impl<'db> Type<'db> {
                 self_function.has_relation_to_impl(
                     db,
                     target_function,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -937,6 +1001,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     target_method,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -946,6 +1011,7 @@ impl<'db> Type<'db> {
                 self_method.has_relation_to_impl(
                     db,
                     target_method,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -979,6 +1045,7 @@ impl<'db> Type<'db> {
                     self_callable.has_relation_to_impl(
                         db,
                         other_callable,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -992,6 +1059,7 @@ impl<'db> Type<'db> {
                         callables.has_relation_to_impl(
                             db,
                             other_callable,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -1014,6 +1082,7 @@ impl<'db> Type<'db> {
                 KnownClass::Type.to_instance(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1026,6 +1095,7 @@ impl<'db> Type<'db> {
                     self.satisfies_protocol(
                         db,
                         protocol,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1042,6 +1112,7 @@ impl<'db> Type<'db> {
                     self_typeddict.has_relation_to_impl(
                         db,
                         other_typeddict,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1059,6 +1130,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         target,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1118,6 +1190,7 @@ impl<'db> Type<'db> {
                         sequence.has_relation_to_impl(
                             db,
                             other_class,
+                            constraints,
                             inferable,
                             relation,
                             relation_visitor,
@@ -1157,6 +1230,7 @@ impl<'db> Type<'db> {
                 instance.has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1169,6 +1243,7 @@ impl<'db> Type<'db> {
                 KnownClass::MethodType.to_instance(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1179,6 +1254,7 @@ impl<'db> Type<'db> {
                 method.class().to_instance(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1190,6 +1266,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1207,6 +1284,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     right.return_type(db),
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1216,6 +1294,7 @@ impl<'db> Type<'db> {
                     right.return_type(db).has_relation_to_impl(
                         db,
                         left.return_type(db),
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1228,6 +1307,7 @@ impl<'db> Type<'db> {
                 left.return_type(db).has_relation_to_impl(
                     db,
                     right.return_type(db),
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1240,6 +1320,7 @@ impl<'db> Type<'db> {
                 KnownClass::Bool.to_instance(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1254,6 +1335,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         target,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1269,6 +1351,7 @@ impl<'db> Type<'db> {
             (Type::BoundSuper(_), _) => KnownClass::Super.to_instance(db).has_relation_to_impl(
                 db,
                 target,
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1290,6 +1373,7 @@ impl<'db> Type<'db> {
                     class.default_specialization(db).has_relation_to_impl(
                         db,
                         subclass_of_class,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1306,6 +1390,7 @@ impl<'db> Type<'db> {
                 class.default_specialization(db).has_relation_to_impl(
                     db,
                     ClassType::Generic(target_alias),
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1318,6 +1403,7 @@ impl<'db> Type<'db> {
                 ClassType::Generic(self_alias).has_relation_to_impl(
                     db,
                     ClassType::Generic(target_alias),
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1332,6 +1418,7 @@ impl<'db> Type<'db> {
                     ClassType::Generic(alias).has_relation_to_impl(
                         db,
                         subclass_of_class,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1345,6 +1432,7 @@ impl<'db> Type<'db> {
                 self_subclass_ty.has_relation_to_impl(
                     db,
                     target_subclass_ty,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1359,6 +1447,7 @@ impl<'db> Type<'db> {
                 class.metaclass_instance_type(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1370,6 +1459,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1383,6 +1473,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1393,6 +1484,7 @@ impl<'db> Type<'db> {
                             other.has_relation_to_impl(
                                 db,
                                 KnownClass::Type.to_instance(db),
+                                constraints,
                                 inferable,
                                 relation,
                                 relation_visitor,
@@ -1409,6 +1501,7 @@ impl<'db> Type<'db> {
                 other.has_relation_to_impl(
                     db,
                     KnownClass::Type.to_instance(db),
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1431,6 +1524,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1443,6 +1537,7 @@ impl<'db> Type<'db> {
             (Type::SpecialForm(left), right) => left.instance_fallback(db).has_relation_to_impl(
                 db,
                 right,
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1452,6 +1547,7 @@ impl<'db> Type<'db> {
             (Type::KnownInstance(left), right) => left.instance_fallback(db).has_relation_to_impl(
                 db,
                 right,
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1465,6 +1561,7 @@ impl<'db> Type<'db> {
                     self_instance.has_relation_to_impl(
                         db,
                         target_instance,
+                        constraints,
                         inferable,
                         relation,
                         relation_visitor,
@@ -1477,6 +1574,7 @@ impl<'db> Type<'db> {
                 KnownClass::Property.to_instance(db).has_relation_to_impl(
                     db,
                     target,
+                    constraints,
                     inferable,
                     relation,
                     relation_visitor,
@@ -1486,6 +1584,7 @@ impl<'db> Type<'db> {
             (_, Type::PropertyInstance(_)) => self.has_relation_to_impl(
                 db,
                 KnownClass::Property.to_instance(db),
+                constraints,
                 inferable,
                 relation,
                 relation_visitor,
@@ -1521,13 +1620,20 @@ impl<'db> Type<'db> {
         other: Type<'db>,
         inferable: InferableTypeVars<'_, 'db>,
     ) -> ConstraintSet<'db> {
-        self.is_equivalent_to_impl(db, other, inferable, &IsEquivalentVisitor::default())
+        self.is_equivalent_to_impl(
+            db,
+            other,
+            &mut ConstraintSetBuilder::new(),
+            inferable,
+            &IsEquivalentVisitor::default(),
+        )
     }
 
     pub(crate) fn is_equivalent_to_impl(
         self,
         db: &'db dyn Db,
         other: Type<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
@@ -1557,14 +1663,14 @@ impl<'db> Type<'db> {
             (Type::TypeAlias(self_alias), _) => {
                 let self_alias_ty = self_alias.value_type(db).normalized(db);
                 visitor.visit((self_alias_ty, other), || {
-                    self_alias_ty.is_equivalent_to_impl(db, other, inferable, visitor)
+                    self_alias_ty.is_equivalent_to_impl(db, other, constraints, inferable, visitor)
                 })
             }
 
             (_, Type::TypeAlias(other_alias)) => {
                 let other_alias_ty = other_alias.value_type(db).normalized(db);
                 visitor.visit((self, other_alias_ty), || {
-                    self.is_equivalent_to_impl(db, other_alias_ty, inferable, visitor)
+                    self.is_equivalent_to_impl(db, other_alias_ty, constraints, inferable, visitor)
                 })
             }
 
@@ -1573,32 +1679,43 @@ impl<'db> Type<'db> {
             }
 
             (Type::NominalInstance(first), Type::NominalInstance(second)) => {
-                first.is_equivalent_to_impl(db, second, inferable, visitor)
+                first.is_equivalent_to_impl(db, second, constraints, inferable, visitor)
             }
 
             (Type::Union(first), Type::Union(second)) => {
-                first.is_equivalent_to_impl(db, second, inferable, visitor)
+                first.is_equivalent_to_impl(db, second, constraints, inferable, visitor)
             }
 
             (Type::Intersection(first), Type::Intersection(second)) => {
-                first.is_equivalent_to_impl(db, second, inferable, visitor)
+                first.is_equivalent_to_impl(db, second, constraints, inferable, visitor)
             }
 
             (Type::FunctionLiteral(self_function), Type::FunctionLiteral(target_function)) => {
-                self_function.is_equivalent_to_impl(db, target_function, inferable, visitor)
+                self_function.is_equivalent_to_impl(
+                    db,
+                    target_function,
+                    constraints,
+                    inferable,
+                    visitor,
+                )
             }
-            (Type::BoundMethod(self_method), Type::BoundMethod(target_method)) => {
-                self_method.is_equivalent_to_impl(db, target_method, inferable, visitor)
-            }
+            (Type::BoundMethod(self_method), Type::BoundMethod(target_method)) => self_method
+                .is_equivalent_to_impl(db, target_method, constraints, inferable, visitor),
             (Type::KnownBoundMethod(self_method), Type::KnownBoundMethod(target_method)) => {
-                self_method.is_equivalent_to_impl(db, target_method, inferable, visitor)
+                self_method.is_equivalent_to_impl(
+                    db,
+                    target_method,
+                    constraints,
+                    inferable,
+                    visitor,
+                )
             }
             (Type::Callable(first), Type::Callable(second)) => {
-                first.is_equivalent_to_impl(db, second, inferable, visitor)
+                first.is_equivalent_to_impl(db, second, constraints, inferable, visitor)
             }
 
             (Type::ProtocolInstance(first), Type::ProtocolInstance(second)) => {
-                first.is_equivalent_to_impl(db, second, inferable, visitor)
+                first.is_equivalent_to_impl(db, second, constraints, inferable, visitor)
             }
             (Type::ProtocolInstance(protocol), nominal @ Type::NominalInstance(n))
             | (nominal @ Type::NominalInstance(n), Type::ProtocolInstance(protocol)) => {
@@ -1615,11 +1732,11 @@ impl<'db> Type<'db> {
             }
 
             (Type::PropertyInstance(left), Type::PropertyInstance(right)) => {
-                left.is_equivalent_to_impl(db, right, inferable, visitor)
+                left.is_equivalent_to_impl(db, right, constraints, inferable, visitor)
             }
 
             (Type::TypedDict(left), Type::TypedDict(right)) => visitor.visit((self, other), || {
-                left.is_equivalent_to_impl(db, right, inferable, visitor)
+                left.is_equivalent_to_impl(db, right, constraints, inferable, visitor)
             }),
 
             _ => ConstraintSet::from(false),
@@ -1655,6 +1772,7 @@ impl<'db> Type<'db> {
         self.is_disjoint_from_impl(
             db,
             other,
+            &mut ConstraintSetBuilder::new(),
             inferable,
             &IsDisjointVisitor::default(),
             &HasRelationToVisitor::default(),
@@ -1665,6 +1783,7 @@ impl<'db> Type<'db> {
         self,
         db: &'db dyn Db,
         other: Type<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
@@ -1673,25 +1792,30 @@ impl<'db> Type<'db> {
             db: &'db dyn Db,
             protocol: ProtocolInstanceType<'db>,
             other: Type<'db>,
+            constraints: &mut ConstraintSetBuilder<'db>,
             inferable: InferableTypeVars<'_, 'db>,
             disjointness_visitor: &IsDisjointVisitor<'db>,
             relation_visitor: &HasRelationToVisitor<'db>,
         ) -> ConstraintSet<'db> {
-            protocol.interface(db).members(db).when_any(db, |member| {
-                other
-                    .member(db, member.name())
-                    .place
-                    .ignore_possibly_undefined()
-                    .when_none_or(|attribute_type| {
-                        member.has_disjoint_type_from(
-                            db,
-                            attribute_type,
-                            inferable,
-                            disjointness_visitor,
-                            relation_visitor,
-                        )
-                    })
-            })
+            protocol
+                .interface(db)
+                .members(db)
+                .when_any(db, constraints, |constraints, member| {
+                    other
+                        .member(db, member.name())
+                        .place
+                        .ignore_possibly_undefined()
+                        .when_none_or(|attribute_type| {
+                            member.has_disjoint_type_from(
+                                db,
+                                attribute_type,
+                                constraints,
+                                inferable,
+                                disjointness_visitor,
+                                relation_visitor,
+                            )
+                        })
+                })
         }
 
         match (self, other) {
@@ -1705,6 +1829,7 @@ impl<'db> Type<'db> {
                     self_alias_ty.is_disjoint_from_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -1718,6 +1843,7 @@ impl<'db> Type<'db> {
                     self.is_disjoint_from_impl(
                         db,
                         other_alias_ty,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -1739,6 +1865,7 @@ impl<'db> Type<'db> {
                 Type::TypeVar(type_var).is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -1754,6 +1881,7 @@ impl<'db> Type<'db> {
                         Type::TypeVar(this_instance).is_disjoint_from_impl(
                             db,
                             other_instance,
+                            constraints,
                             inferable,
                             disjointness_visitor,
                             relation_visitor,
@@ -1769,6 +1897,7 @@ impl<'db> Type<'db> {
                         Type::TypeVar(this_instance).is_disjoint_from_impl(
                             db,
                             other_instance,
+                            constraints,
                             inferable,
                             disjointness_visitor,
                             relation_visitor,
@@ -1808,20 +1937,26 @@ impl<'db> Type<'db> {
                         .is_disjoint_from_impl(
                             db,
                             other,
+                            constraints,
                             inferable,
                             disjointness_visitor,
                             relation_visitor,
                         ),
-                    Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
-                        constraints.elements(db).iter().when_all(db, |constraint| {
-                            constraint.is_disjoint_from_impl(
-                                db,
-                                other,
-                                inferable,
-                                disjointness_visitor,
-                                relation_visitor,
-                            )
-                        })
+                    Some(TypeVarBoundOrConstraints::Constraints(typevar_constraints)) => {
+                        typevar_constraints.elements(db).iter().when_all(
+                            db,
+                            constraints,
+                            |constraints, constraint| {
+                                constraint.is_disjoint_from_impl(
+                                    db,
+                                    other,
+                                    constraints,
+                                    inferable,
+                                    disjointness_visitor,
+                                    relation_visitor,
+                                )
+                            },
+                        )
                     }
                 }
             }
@@ -1829,17 +1964,19 @@ impl<'db> Type<'db> {
             // TODO: Infer specializations here
             (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => ConstraintSet::from(false),
 
-            (Type::Union(union), other) | (other, Type::Union(union)) => {
-                union.elements(db).iter().when_all(db, |e| {
+            (Type::Union(union), other) | (other, Type::Union(union)) => union
+                .elements(db)
+                .iter()
+                .when_all(db, constraints, |constraints, e| {
                     e.is_disjoint_from_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
                     )
-                })
-            }
+                }),
 
             // If we have two intersections, we test the positive elements of each one against the other intersection
             // Negative elements need a positive element on the other side in order to be disjoint.
@@ -1849,25 +1986,31 @@ impl<'db> Type<'db> {
                     self_intersection
                         .positive(db)
                         .iter()
-                        .when_any(db, |p| {
+                        .when_any(db, constraints, |constraints, p| {
                             p.is_disjoint_from_impl(
                                 db,
                                 other,
+                                constraints,
                                 inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             )
                         })
                         .or(db, || {
-                            other_intersection.positive(db).iter().when_any(db, |p| {
-                                p.is_disjoint_from_impl(
-                                    db,
-                                    self,
-                                    inferable,
-                                    disjointness_visitor,
-                                    relation_visitor,
-                                )
-                            })
+                            other_intersection.positive(db).iter().when_any(
+                                db,
+                                constraints,
+                                |constraints, p| {
+                                    p.is_disjoint_from_impl(
+                                        db,
+                                        self,
+                                        constraints,
+                                        inferable,
+                                        disjointness_visitor,
+                                        relation_visitor,
+                                    )
+                                },
+                            )
                         })
                 })
             }
@@ -1878,10 +2021,11 @@ impl<'db> Type<'db> {
                     intersection
                         .positive(db)
                         .iter()
-                        .when_any(db, |p| {
+                        .when_any(db, constraints, |constraints, p| {
                             p.is_disjoint_from_impl(
                                 db,
                                 non_intersection,
+                                constraints,
                                 inferable,
                                 disjointness_visitor,
                                 relation_visitor,
@@ -1889,16 +2033,21 @@ impl<'db> Type<'db> {
                         })
                         // A & B & Not[C] is disjoint from C
                         .or(db, || {
-                            intersection.negative(db).iter().when_any(db, |&neg_ty| {
-                                non_intersection.has_relation_to_impl(
-                                    db,
-                                    neg_ty,
-                                    inferable,
-                                    TypeRelation::Subtyping,
-                                    relation_visitor,
-                                    disjointness_visitor,
-                                )
-                            })
+                            intersection.negative(db).iter().when_any(
+                                db,
+                                constraints,
+                                |constraints, &neg_ty| {
+                                    non_intersection.has_relation_to_impl(
+                                        db,
+                                        neg_ty,
+                                        constraints,
+                                        inferable,
+                                        TypeRelation::Subtyping,
+                                        relation_visitor,
+                                        disjointness_visitor,
+                                    )
+                                },
+                            )
                         })
                 })
             }
@@ -1975,7 +2124,13 @@ impl<'db> Type<'db> {
 
             (Type::ProtocolInstance(left), Type::ProtocolInstance(right)) => disjointness_visitor
                 .visit((self, other), || {
-                    left.is_disjoint_from_impl(db, right, inferable, disjointness_visitor)
+                    left.is_disjoint_from_impl(
+                        db,
+                        right,
+                        constraints,
+                        inferable,
+                        disjointness_visitor,
+                    )
                 }),
 
             (Type::ProtocolInstance(protocol), Type::SpecialForm(special_form))
@@ -1985,6 +2140,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         special_form.instance_fallback(db),
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -1999,6 +2155,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         known_instance.instance_fallback(db),
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2063,6 +2220,7 @@ impl<'db> Type<'db> {
                     db,
                     protocol,
                     ty,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2081,6 +2239,7 @@ impl<'db> Type<'db> {
                         db,
                         protocol,
                         nominal,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2091,20 +2250,23 @@ impl<'db> Type<'db> {
             (Type::ProtocolInstance(protocol), other)
             | (other, Type::ProtocolInstance(protocol)) => {
                 disjointness_visitor.visit((self, other), || {
-                    protocol.interface(db).members(db).when_any(db, |member| {
-                        match other.member(db, member.name()).place {
+                    protocol.interface(db).members(db).when_any(
+                        db,
+                        constraints,
+                        |constraints, member| match other.member(db, member.name()).place {
                             Place::Defined(DefinedPlace {
                                 ty: attribute_type, ..
                             }) => member.has_disjoint_type_from(
                                 db,
                                 attribute_type,
+                                constraints,
                                 inferable,
                                 disjointness_visitor,
                                 relation_visitor,
                             ),
                             Place::Undefined => ConstraintSet::from(false),
-                        }
-                    })
+                        },
+                    )
                 })
             }
 
@@ -2119,6 +2281,7 @@ impl<'db> Type<'db> {
                     left_alias.specialization(db).is_disjoint_from_impl(
                         db,
                         right_alias.specialization(db),
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2134,6 +2297,7 @@ impl<'db> Type<'db> {
                     other.is_disjoint_from_impl(
                         db,
                         Type::GenericAlias(alias),
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2163,7 +2327,7 @@ impl<'db> Type<'db> {
             }
 
             (Type::SubclassOf(left), Type::SubclassOf(right)) => {
-                left.is_disjoint_from_impl(db, right, inferable, disjointness_visitor)
+                left.is_disjoint_from_impl(db, right, constraints, inferable, disjointness_visitor)
             }
 
             // for `type[Any]`/`type[Unknown]`/`type[Todo]`, we know the type cannot be any larger than `type`,
@@ -2174,6 +2338,7 @@ impl<'db> Type<'db> {
                     KnownClass::Type.to_instance(db).is_disjoint_from_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2183,6 +2348,7 @@ impl<'db> Type<'db> {
                     class.metaclass_instance_type(db).is_disjoint_from_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2263,6 +2429,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         instance,
+                        constraints,
                         inferable,
                         TypeRelation::Subtyping,
                         relation_visitor,
@@ -2287,6 +2454,7 @@ impl<'db> Type<'db> {
                     .has_relation_to_impl(
                         db,
                         instance,
+                        constraints,
                         inferable,
                         TypeRelation::Subtyping,
                         relation_visitor,
@@ -2309,6 +2477,7 @@ impl<'db> Type<'db> {
                 .is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2318,6 +2487,7 @@ impl<'db> Type<'db> {
                 method.class().to_instance(db).is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2330,6 +2500,7 @@ impl<'db> Type<'db> {
                     .is_disjoint_from_impl(
                         db,
                         other,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2381,6 +2552,7 @@ impl<'db> Type<'db> {
                         .has_relation_to_impl(
                             db,
                             Type::Callable(CallableType::unknown(db)),
+                            constraints,
                             inferable,
                             TypeRelation::Assignability,
                             relation_visitor,
@@ -2407,6 +2579,7 @@ impl<'db> Type<'db> {
                 other.is_disjoint_from_impl(
                     db,
                     KnownClass::ModuleType.to_instance(db),
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2418,6 +2591,7 @@ impl<'db> Type<'db> {
                     left.is_disjoint_from_impl(
                         db,
                         right,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2431,6 +2605,7 @@ impl<'db> Type<'db> {
                 newtype.concrete_base_type(db).is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2441,6 +2616,7 @@ impl<'db> Type<'db> {
                 KnownClass::Property.to_instance(db).is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2454,6 +2630,7 @@ impl<'db> Type<'db> {
                 KnownClass::Super.to_instance(db).is_disjoint_from_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     disjointness_visitor,
                     relation_visitor,
@@ -2467,6 +2644,7 @@ impl<'db> Type<'db> {
                     self_typeddict.is_disjoint_from_impl(
                         db,
                         other_typeddict,
+                        constraints,
                         inferable,
                         disjointness_visitor,
                         relation_visitor,
@@ -2483,6 +2661,7 @@ impl<'db> Type<'db> {
                 .has_relation_to_impl(
                     db,
                     other,
+                    constraints,
                     inferable,
                     TypeRelation::Assignability,
                     relation_visitor,

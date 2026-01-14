@@ -17,7 +17,9 @@ use crate::semantic_index::{
     DeclarationWithConstraint, SemanticIndex, attribute_declarations, attribute_scopes,
 };
 use crate::types::bound_super::BoundSuperError;
-use crate::types::constraints::{ConstraintSet, IteratorConstraintsExtension};
+use crate::types::constraints::{
+    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
+};
 use crate::types::context::InferContext;
 use crate::types::diagnostic::{
     DUPLICATE_BASE, INCONSISTENT_MRO, INVALID_DATACLASS_OVERRIDE, INVALID_TYPE_ALIAS_TYPE,
@@ -1123,19 +1125,26 @@ impl<'db> ClassType<'db> {
 
     /// Return `true` if `other` is present in this class's MRO.
     pub(super) fn is_subclass_of(self, db: &'db dyn Db, other: ClassType<'db>) -> bool {
-        self.when_subclass_of(db, other, InferableTypeVars::None)
-            .is_always_satisfied(db)
+        self.when_subclass_of(
+            db,
+            other,
+            &mut ConstraintSetBuilder::new(),
+            InferableTypeVars::None,
+        )
+        .is_always_satisfied(db)
     }
 
     pub(super) fn when_subclass_of(
         self,
         db: &'db dyn Db,
         other: ClassType<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
     ) -> ConstraintSet<'db> {
         self.has_relation_to_impl(
             db,
             other,
+            constraints,
             inferable,
             TypeRelation::Subtyping,
             &HasRelationToVisitor::default(),
@@ -1143,67 +1152,73 @@ impl<'db> ClassType<'db> {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn has_relation_to_impl(
         self,
         db: &'db dyn Db,
         other: Self,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         relation: TypeRelation<'db>,
         relation_visitor: &HasRelationToVisitor<'db>,
         disjointness_visitor: &IsDisjointVisitor<'db>,
     ) -> ConstraintSet<'db> {
-        self.iter_mro(db).when_any(db, |base| {
-            match base {
-                ClassBase::Dynamic(_) => match relation {
-                    TypeRelation::Subtyping
-                    | TypeRelation::Redundancy
-                    | TypeRelation::SubtypingAssuming(_) => {
-                        ConstraintSet::from(other.is_object(db))
-                    }
-                    TypeRelation::Assignability | TypeRelation::ConstraintSetAssignability => {
-                        ConstraintSet::from(!other.is_final(db))
-                    }
-                },
+        self.iter_mro(db)
+            .when_any(db, constraints, |constraints, base| {
+                match base {
+                    ClassBase::Dynamic(_) => match relation {
+                        TypeRelation::Subtyping
+                        | TypeRelation::Redundancy
+                        | TypeRelation::SubtypingAssuming(_) => {
+                            ConstraintSet::from(other.is_object(db))
+                        }
+                        TypeRelation::Assignability | TypeRelation::ConstraintSetAssignability => {
+                            ConstraintSet::from(!other.is_final(db))
+                        }
+                    },
 
-                // Protocol, Generic, and TypedDict are special bases that don't match ClassType.
-                ClassBase::Protocol | ClassBase::Generic | ClassBase::TypedDict => {
-                    ConstraintSet::from(false)
-                }
-
-                ClassBase::Class(base) => match (base, other) {
-                    // Two non-generic classes match if they have the same class literal.
-                    (ClassType::NonGeneric(base_literal), ClassType::NonGeneric(other_literal)) => {
-                        ConstraintSet::from(base_literal == other_literal)
-                    }
-
-                    // Two generic classes match if they have the same origin and compatible specializations.
-                    (ClassType::Generic(base), ClassType::Generic(other)) => {
-                        ConstraintSet::from(base.origin(db) == other.origin(db)).and(db, || {
-                            base.specialization(db).has_relation_to_impl(
-                                db,
-                                other.specialization(db),
-                                inferable,
-                                relation,
-                                relation_visitor,
-                                disjointness_visitor,
-                            )
-                        })
-                    }
-
-                    // Generic and non-generic classes don't match.
-                    (ClassType::Generic(_), ClassType::NonGeneric(_))
-                    | (ClassType::NonGeneric(_), ClassType::Generic(_)) => {
+                    // Protocol, Generic, and TypedDict are special bases that don't match ClassType.
+                    ClassBase::Protocol | ClassBase::Generic | ClassBase::TypedDict => {
                         ConstraintSet::from(false)
                     }
-                },
-            }
-        })
+
+                    ClassBase::Class(base) => match (base, other) {
+                        // Two non-generic classes match if they have the same class literal.
+                        (
+                            ClassType::NonGeneric(base_literal),
+                            ClassType::NonGeneric(other_literal),
+                        ) => ConstraintSet::from(base_literal == other_literal),
+
+                        // Two generic classes match if they have the same origin and compatible specializations.
+                        (ClassType::Generic(base), ClassType::Generic(other)) => {
+                            ConstraintSet::from(base.origin(db) == other.origin(db)).and(db, || {
+                                base.specialization(db).has_relation_to_impl(
+                                    db,
+                                    other.specialization(db),
+                                    constraints,
+                                    inferable,
+                                    relation,
+                                    relation_visitor,
+                                    disjointness_visitor,
+                                )
+                            })
+                        }
+
+                        // Generic and non-generic classes don't match.
+                        (ClassType::Generic(_), ClassType::NonGeneric(_))
+                        | (ClassType::NonGeneric(_), ClassType::Generic(_)) => {
+                            ConstraintSet::from(false)
+                        }
+                    },
+                }
+            })
     }
 
     pub(super) fn is_equivalent_to_impl(
         self,
         db: &'db dyn Db,
         other: ClassType<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         visitor: &IsEquivalentVisitor<'db>,
     ) -> ConstraintSet<'db> {
@@ -1223,6 +1238,7 @@ impl<'db> ClassType<'db> {
                     this.specialization(db).is_equivalent_to_impl(
                         db,
                         other.specialization(db),
+                        constraints,
                         inferable,
                         visitor,
                     )

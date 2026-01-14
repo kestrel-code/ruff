@@ -69,6 +69,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt::Display;
+use std::marker::PhantomData;
 use std::ops::Range;
 
 use itertools::Itertools;
@@ -123,7 +124,8 @@ pub(crate) trait IteratorConstraintsExtension<T> {
     fn when_any<'db>(
         self,
         db: &'db dyn Db,
-        f: impl FnMut(T) -> ConstraintSet<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
+        f: impl FnMut(&mut ConstraintSetBuilder<'db>, T) -> ConstraintSet<'db>,
     ) -> ConstraintSet<'db>;
 
     /// Returns the constraints under which every element of the iterator holds.
@@ -134,7 +136,8 @@ pub(crate) trait IteratorConstraintsExtension<T> {
     fn when_all<'db>(
         self,
         db: &'db dyn Db,
-        f: impl FnMut(T) -> ConstraintSet<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
+        f: impl FnMut(&mut ConstraintSetBuilder<'db>, T) -> ConstraintSet<'db>,
     ) -> ConstraintSet<'db>;
 }
 
@@ -145,7 +148,8 @@ where
     fn when_any<'db>(
         self,
         db: &'db dyn Db,
-        mut f: impl FnMut(T) -> ConstraintSet<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
+        mut f: impl FnMut(&mut ConstraintSetBuilder<'db>, T) -> ConstraintSet<'db>,
     ) -> ConstraintSet<'db> {
         let node = Node::distributed_or(db, self.map(|element| f(element).node));
         ConstraintSet { node }
@@ -154,7 +158,8 @@ where
     fn when_all<'db>(
         self,
         db: &'db dyn Db,
-        mut f: impl FnMut(T) -> ConstraintSet<'db>,
+        constraints: &mut ConstraintSetBuilder<'db>,
+        mut f: impl FnMut(&mut ConstraintSetBuilder<'db>, T) -> ConstraintSet<'db>,
     ) -> ConstraintSet<'db> {
         let node = Node::distributed_and(db, self.map(|element| f(element).node));
         ConstraintSet { node }
@@ -458,6 +463,18 @@ impl<'db> ConstraintSet<'db> {
 impl From<bool> for ConstraintSet<'_> {
     fn from(b: bool) -> Self {
         if b { Self::always() } else { Self::never() }
+    }
+}
+
+pub(crate) struct ConstraintSetBuilder<'db> {
+    _dummy: PhantomData<&'db ()>,
+}
+
+impl ConstraintSetBuilder<'_> {
+    pub(crate) fn new() -> Self {
+        Self {
+            _dummy: PhantomData,
+        }
     }
 }
 
@@ -4135,6 +4152,7 @@ impl<'db> GenericContext<'db> {
     pub(crate) fn specialize_constrained(
         self,
         db: &'db dyn Db,
+        builder: &mut ConstraintSetBuilder<'db>,
         constraints: ConstraintSet<'db>,
     ) -> Result<Specialization<'db>, ()> {
         tracing::trace!(

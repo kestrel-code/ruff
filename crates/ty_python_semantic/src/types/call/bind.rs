@@ -25,7 +25,7 @@ use crate::db::Db;
 use crate::dunder_all::dunder_all_names;
 use crate::place::{DefinedPlace, Definedness, Place, known_module_symbol};
 use crate::types::call::arguments::{Expansion, is_expandable_type};
-use crate::types::constraints::ConstraintSet;
+use crate::types::constraints::{ConstraintSet, ConstraintSetBuilder};
 use crate::types::diagnostic::{
     CALL_NON_CALLABLE, CALL_TOP_CALLABLE, CONFLICTING_ARGUMENT_FORMS, INVALID_ARGUMENT_TYPE,
     INVALID_DATACLASS, MISSING_ARGUMENT, NO_MATCHING_OVERLOAD, PARAMETER_ALREADY_ASSIGNED,
@@ -1554,8 +1554,12 @@ impl<'db> Bindings<'db> {
                         else {
                             continue;
                         };
-                        let specialization =
-                            generic_context.specialize_constrained(db, constraints.constraints(db));
+                        let mut builder = ConstraintSetBuilder::new();
+                        let specialization = generic_context.specialize_constrained(
+                            db,
+                            &mut builder,
+                            constraints.constraints(db),
+                        );
                         let result = match specialization {
                             Ok(specialization) => Type::KnownInstance(
                                 KnownInstanceType::Specialization(specialization),
